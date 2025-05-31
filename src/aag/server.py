@@ -1,4 +1,3 @@
-print("--- SERVER.PY VERSION CHECK: v5.0 - FINAL CHECK MAY 29 ---") # <--- 使用一个全新的标记!
 import json # 导入 json 模块
 import asyncio # 导入 asyncio
 from pathlib import Path # 导入 Path 模块

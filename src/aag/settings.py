@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from enum import StrEnum
 
 
@@ -21,21 +21,43 @@ class Thresholds(BaseModel):
 
 
 class Heater(BaseModel):
-    min_power: float = 0
-    low_temp: float = 0
-    low_delta: float = 6
-    high_temp: float = 20
-    high_delta: float = 4
-    impulse_temp: float = 10
-    impulse_duration: float = 60
-    impulse_cycle: int = 600
+    # 雨盘加热（Rain Sensor Heater）相关
+    rain_threshold_freq: float = Field(default=30.0, description="雨频判“湿”阈值 (Hz)")
+    pwm_max: float = Field(default=70.0, description="湿态/下雨加热功率 (%)")
+    pwm_mid: float = Field(default=40.0, description="中温加热功率 (盘面干燥，温度低于低温阈值时, %)")
+    pwm_low: float = Field(default=15.0, description="低温轻度保温功率 (%)")
+    hysteresis: float = Field(default=5.0, description="PWM 变化缓冲 (%)")
+    
+    # 环境温度阈值组
+    low_temp: float = Field(default=0.0, description="最低保温温度 (°C)")
+    low_delta: float = Field(default=6.0, description="低温缓冲区大小 (°C)")
+    high_temp: float = Field(default=20.0, description="最高关闭温度 (°C)") # 修正拼写
+    high_delta: float = Field(default=4.0, description="高温缓冲区大小 (°C)") # 修正拼写
+    
+    # 冲击加热（Impulse Heater）部分
+    impulse_temp: float = Field(default=10.0, description="冲击加热触发温度 (°C)")
+    impulse_duration: float = Field(default=60.0, description="冲击加热持续时间 (秒)")
+    impulse_cycle: int = Field(default=600, description="冲击加热循环周期 (秒)")
+
+    # 运行时初始状态 (min_power 用于 connect() 中的初始设置)
+    min_power: float = Field(default=15, description="传感器连接时设置的初始PWM功率 (%)")
+
 
 class Location(BaseModel):
     name: str = 'AAG CloudWatcher'
-    elevation: float = 100.0  # meters
-    latitude: float = 19.54  # degrees
-    longitude: float = -155.58  # degrees
-    timezone: str = 'US/Hawaii'
+    elevation: float = 60.0  # meters
+    latitude: float = 49.054  # degrees
+    longitude: float = -122.82  # degrees
+    timezone: str = 'America/Vancouver'
+
+class Skytemp(BaseModel):
+    K1: float = 33.0
+    K2: float = 0.0
+    K3: float = 0.0
+    K4: float = 0.0
+    K5: float = 0.0
+    K6: float = 140.0
+    K7: float = 40.0
 
 
 class WeatherSettings(BaseSettings):
@@ -52,6 +74,7 @@ class WeatherSettings(BaseSettings):
     thresholds: Thresholds = Thresholds()
     heater: Heater = Heater()
     location: Location = Location()
+    skytemp: Skytemp = Skytemp()
 
     class Config:
         env_prefix = 'AAG_'

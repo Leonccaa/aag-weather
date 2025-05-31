@@ -33,7 +33,7 @@ class WeatherResponseCodes(StrEnum):
     """ Response Codes (from Rs232_Comms_v100.pdf) """
     GET_SKY_TEMP = '1 '
     GET_SENSOR_TEMP = '2 '
-    GET_VALUES_AMBIENT = '3 '
+    #GET_VALUES_AMBIENT = '3 '  #这个新版本已经不用了
     GET_VALUES_LDR_VOLTAGE = '4 '
     GET_VALUES_SENSOR_TEMP = '5 '
     GET_VALUES_ZENER_VOLTAGE = '6 '
