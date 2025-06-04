@@ -94,7 +94,7 @@ async def periodic_sensor_reading_task():
     print("--- Background task `periodic_sensor_reading_task` has started. ---")
     while True:
         current_time_utc_for_log = datetime.now(timezone.utc)
-        print(f"DEBUG: periodic_sensor_reading_task loop entered at {current_time_utc_for_log.isoformat()}")
+        print(f"periodic_sensor_reading_task loop entered at {current_time_utc_for_log.isoformat()}")
 
         global sensor
         verbose_logging_enabled = False 
@@ -154,8 +154,8 @@ async def periodic_sensor_reading_task():
                 duration = (end_time - start_time).total_seconds()
                 
                 if new_reading_data is not None:
-                    if verbose_logging_enabled:
-                        print(f"[{end_time.isoformat()}] server.py: <<< sensor.get_reading() successful in {duration:.2f} seconds.")
+                    #if verbose_logging_enabled:
+                    print(f"[{end_time.isoformat()}] server.py: <<< sensor.get_reading() successful in {duration:.2f} seconds.")
                     
                     if hasattr(sensor.config, 'solo_data_file_path') and sensor.config.solo_data_file_path:
                         # (SOLO文件写入逻辑保持不变)
