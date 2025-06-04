@@ -1,5 +1,6 @@
 import re
 import time
+import statistics
 from datetime import datetime,timezone
 import math # 导入 math 模块
 from enum import Enum # 导入 Enum
@@ -44,7 +45,7 @@ class CloudSensor(object):
         """
 
         try:
-            # --- 修改：增加详细错误捕获 ---
+            # 增加详细错误捕获 ---
             if 'verbose_logging' in kwargs: # 如果 kwargs 中有 verbose_logging，优先使用它
                 temp_verbose_setting = kwargs['verbose_logging']
             else: # 否则，尝试从 WeatherSettings 的默认值或环境变量获取
@@ -69,9 +70,7 @@ class CloudSensor(object):
                 print("[red]DEBUG: Full traceback for WeatherSettings error:[/red]")
                 traceback.print_exc() # 打印完整的堆栈跟踪
                 # 可以选择重新抛出一个更通用的错误，或者让原始错误冒泡
-                raise # 重新抛出原始异常，以便服务能感知到初始化失败
-            # --- 结束修改 ---
-             # --- 结束新增诊断代码 ---       
+                raise # 重新抛出原始异常，以便服务能感知到初始化失败     
             # self._verbose_logging = self.config.verbose_logging # 这行现在多余，因为上面已经设置了
 
         except Exception as e_outer: # 捕获 self.config 设置失败后可能引发的其他问题
@@ -83,7 +82,7 @@ class CloudSensor(object):
             if not isinstance(e_outer, (SensorCommunicationError, TypeError, ValueError)): # 避免重复包装已知类型
                  raise RuntimeError(f"CloudSensor config initialization failed critically: {e_outer}") from e_outer
 
-        # 新增：状态属性初始化
+        # 状态属性初始化
         self._connection_status: ConnectionStatus = ConnectionStatus.INITIALIZING
         self.last_error_message: str | None = None
         self.last_successful_read_timestamp: datetime | None = None
@@ -120,6 +119,8 @@ class CloudSensor(object):
         self.firmware: str | None = None
         self.serial_number: str | None = None
         self.has_anemometer: bool = False
+        self.electrical_constants: dict | None = None # Added for M! command data
+        self.zener_voltage: float | None = None #Zener voltage
 
         #雨水传感器加热相关部分
         self.current_target_pwm_percent: float = 0.0 
@@ -163,6 +164,11 @@ class CloudSensor(object):
     def skytemp(self) -> Skytemp:
         """Skytemp for the safety checks."""
         return self.config.skytemp    
+    
+    @property
+    def electrical_constants_data(self) -> dict | None:
+        """Public accessor for electrical constants."""
+        return self.electrical_constants
 
     @property
     def status(self) -> dict:
@@ -240,6 +246,9 @@ class CloudSensor(object):
                 raise SensorCommunicationError("连接后检查风速计能力失败")
             self.has_anemometer = True if isinstance(can_get_wind_val, str) and 'Y' in can_get_wind_val.upper() else False
 
+            # 获取电气常数 M! 目前的读数有问题
+            self._fetch_electrical_constants() # Call the new method
+
             # 启动时将PWM设置为最小值。 
             set_initial_pwm_success = self.set_pwm(self.heater_config.min_power)
             if set_initial_pwm_success is COMMUNICATION_ERROR_SENTINEL or not set_initial_pwm_success:
@@ -305,13 +314,12 @@ class CloudSensor(object):
             self.last_error_message = f"捕获循环错误: {e}"
             if current_verbose: print(f"[red]在捕获循环中发生错误: {e}")
 
-    def get_reading(self, units: WhichUnits = 'none', get_errors: bool = False, avg_times: int = 1, verbose: bool = False) -> dict: # avg_times 默认改为1，与server.py一致
+    def get_reading(self, units: WhichUnits = 'none', avg_times: int = 1, verbose: bool = False) -> dict: # avg_times 默认改为1，与server.py一致
         """ Get a single reading of all values.
 
         Args:
             units: The astropy units to return the reading in, default 'none',
                 can be 'metric' or 'imperial'.
-            get_errors: Whether to get the internal errors, default False.
             avg_times: The number of times to average the readings, default 3.
 
         Returns:
@@ -346,7 +354,7 @@ class CloudSensor(object):
                         return None
                 return None
 
-            values = []
+            values: list[float] = []
             for i in range(n):
                 val = fn_to_avg()
                 if val is COMMUNICATION_ERROR_SENTINEL:
@@ -366,8 +374,38 @@ class CloudSensor(object):
             if not values:
                 if current_verbose: print(f"[yellow]警告: {fn_to_avg.__name__} 的所有 {n} 次读数均无效或为 None。")
                 return None
-            return round(sum(values) / len(values), 2)
 
+            # 如果只有一个有效值，直接返回该值
+            if len(values) == 1:
+                return round(values[0], 2)
+
+            #这里按照手册的推荐来计算
+            #Perform more than one single reading (say, 5) and apply a statistical analysis to the values to exclude any outlier.
+            # I am using 5 readings and calculate the average value (AVG) and standard deviation (STD).
+            # Any values that are outside the range AVGSTD and AVG+STD are excluded. The final value is the average of the values which were not excluded;
+            
+            # 计算平均值和标准差（使用总体标准差）
+            try:
+                mean = statistics.mean(values)
+                std = statistics.pstdev(values)
+            except statistics.StatisticsError:
+                # 仅当 values 为空时才会抛出，但此处已做非空判断，故不太可能走到这里
+                if current_verbose:
+                    print(f"[yellow]警告: {fn_to_avg.__name__} 无法计算标准差，使用所有值的平均值。")
+                return round(sum(values) / len(values), 2)
+
+            # 过滤掉超出 [mean - std, mean + std] 范围之外的值
+            filtered = [v for v in values if (mean - std) <= v <= (mean + std)]
+
+            # 如果所有值都被过滤掉，则返回 None 并给出警告
+            if not filtered:
+                if current_verbose:
+                    print(f"[yellow]警告: {fn_to_avg.__name__} 的 {n} 次读数全部被标准差范围 [{mean - std:.2f}, {mean + std:.2f}] 剔除。")
+                return None
+
+            # 返回过滤后剩余值的平均值
+            return round(sum(filtered) / len(filtered), 2)
+    
         # --- 使用配置的时区生成时间戳 ---
         try:
             # 使用配置中定义的时区
@@ -412,10 +450,14 @@ class CloudSensor(object):
                 return None # 返回 None 表示该值获取失败，但不一定是哨兵
             return value_or_sentinel
 
-        reading_values['sky_temp'] = process_value('sky_temp', avg_readings(self.get_sky_temperature))
-        #reading_values['sky_ir_temp'] = process_value('sky_temp', avg_readings(self.get_sky_ir))
-        reading_values['wind_speed'] = process_value('wind_speed', avg_readings(lambda: self.get_wind_speed(skip_averaging=True)))
-        reading_values['rain_frequency'] = process_value('rain_frequency', avg_readings(self.get_rain_frequency))
+        reading_values['raw_sky_temp'] = process_value('raw_sky_temp', avg_readings(self.get_sky_temperature))
+        if self.has_anemometer is True:
+            reading_values['wind_speed'] = process_value('wind_speed', avg_readings(lambda: self.get_wind_speed(skip_averaging=True)))
+        else: 
+            reading_values['wind_speed'] = None # 如果没有风速计，直接设置为 None
+
+        #雨频是整数
+        reading_values['rain_frequency'] = int(process_value('rain_frequency', avg_readings(self.get_rain_frequency)))
         reading_values['humidity'] = process_value('humidity', avg_readings(self.get_humidity))
         reading_values['pressure'] = process_value('pressure', avg_readings(self.get_pressure))
         reading_values['RH_sensor_temp'] = process_value('RH_sensor_temp', avg_readings(self.get_rh_sensor_temp))
@@ -446,22 +488,25 @@ class CloudSensor(object):
         # get_values_raw 的第二个参数期望是 WeatherResponseCodes 枚举成员
         # 从 c_command_data 提取原始值
 
+        #Only if the new light sensor is installed.Raw period obtained by the new light sensor
         final_reading_dict['light_sensor_period_raw'] = self.get_values_raw(c_command_data, WeatherResponseCodes.GET_VALUES_LIGHT_SENSOR, verbose=current_verbose)
-        #环境温度传感器 NTC 电压值（Ambient Temp NTC) 0-1023
-        final_reading_dict['ambient_temp_ntc_raw'] = self.get_values_raw(c_command_data, WeatherResponseCodes.GET_VALUES_AMBIENT, verbose=current_verbose)
-        #LDR环境亮度 0-1023
-        final_reading_dict['ambient_ldr_voltage_raw'] = self.get_values_raw(c_command_data, WeatherResponseCodes.GET_VALUES_LDR_VOLTAGE, verbose=current_verbose)
-        #Zener Voltage reference 齐纳电压 0-1023        
-        final_reading_dict['zener_voltage_raw'] = self.get_values_raw(c_command_data, WeatherResponseCodes.GET_VALUES_ZENER_VOLTAGE, verbose=current_verbose)
-        #sensor_temp_ntc 0-1023        
-        final_reading_dict['rain_sensor_temp_ntc_raw'] = self.get_values_raw(c_command_data, WeatherResponseCodes.GET_VALUES_SENSOR_TEMP, verbose=current_verbose)
-        #雨量传感器_电阻
-        _sensor_temp_ntc_raw = final_reading_dict['rain_sensor_temp_ntc_raw']
-        final_reading_dict['rain_sensor_temp_ntc'] = round(self.ntc_raw_to_resistance(int(_sensor_temp_ntc_raw)),0)
-        #这里根据T算法，处理天空温度,代码实现在 sky_temperature.py
+  
+        #环境温度传感器 NTC 电压值（Ambient Temp NTC) 0-1023 #新版本放弃使用
+        #final_reading_dict['ambient_temp_ntc_raw'] = self.get_values_raw(c_command_data, WeatherResponseCodes.GET_VALUES_AMBIENT, verbose=current_verbose)
+       
+        #LDR环境亮度 0-1023 #新版本放弃使用
+        #final_reading_dict['ambient_ldr_voltage_raw'] = self.get_values_raw(c_command_data, WeatherResponseCodes.GET_VALUES_LDR_VOLTAGE, verbose=current_verbose)
+        
+        #Zener Voltage reference 齐纳电压 不写入主序列          
+        #final_reading_dict['zener_voltage'] = self.get_zener_voltage(self.get_values_raw(c_command_data, WeatherResponseCodes.GET_VALUES_ZENER_VOLTAGE, verbose=current_verbose))
+        self.zener_voltage = self.get_zener_voltage(self.get_values_raw(c_command_data, WeatherResponseCodes.GET_VALUES_ZENER_VOLTAGE, verbose=current_verbose))
 
-        if current_verbose: print(f"[DEBUG]Tsky计算参数 ({self.skytemp}) ")
-        final_reading_dict['Tsky_temp'] = round(tsky(final_reading_dict["sky_temp"],final_reading_dict["ambient_temp"],self.skytemp),2)
+        #雨量传感器 温度 sensor_temp_ntc      
+        final_reading_dict['rain_sensor_temp'] = self.get_rain_sensor_temp(self.get_values_raw(c_command_data, WeatherResponseCodes.GET_VALUES_SENSOR_TEMP, verbose=current_verbose))
+        
+        #这里根据T算法，处理天空温度,代码实现在 sky_temperature.py
+        #if current_verbose: print(f"[DEBUG]sky_temp K parameter ({self.skytemp}) ")
+        final_reading_dict['sky_temp'] = round(tsky(final_reading_dict["raw_sky_temp"],final_reading_dict["ambient_temp"],self.skytemp),2)
 
         # 取相对气压
         # 先获取依赖值
@@ -529,21 +574,6 @@ class CloudSensor(object):
              print("[yellow]MPSAS 计算跳过：环境温度为 None，但原始周期值可用。")
         elif current_verbose: 
             print("[grey]MPSAS 计算跳过：原始周期值或环境温度为 None。")
-
-
-        if get_errors:
-            errors_list_val = self.get_errors() # get_errors 内部调用 query
-            if errors_list_val is COMMUNICATION_ERROR_SENTINEL:
-                communication_error_occured_this_cycle = True
-            elif errors_list_val is not None:
-                 if isinstance(errors_list_val, list) :
-                    final_reading_dict.update(**{f'error_{i:02d}': err for i, err in enumerate(errors_list_val)})
-                 else: 
-                    final_reading_dict['error_00'] = errors_list_val
-        
-        if communication_error_occured_this_cycle:
-            if current_verbose: print("[red]get_reading 中断：在获取错误代码时发生通信错误。")
-            return None # 本次读数无效
         
         # Add the safety values.
         # --- 如果到这里都没有通信错误 ---
@@ -629,62 +659,70 @@ class CloudSensor(object):
         """
         # 云况判断
         reading['cloud_condition'] = 'unknown'
-        tsky_val = reading.get("Tsky_temp")
-
+        tsky_val = reading.get("sky_temp")
         if tsky_val is not None:
-                if tsky_val < self.thresholds.very_cloudy:
+            try:
+                rf = float(tsky_val)
+                if rf < self.thresholds.cloudy:
                     reading['cloud_condition'] = 'clear'
-                elif tsky_val > self.thresholds.cloudy:
+                elif rf < self.thresholds.very_cloudy:
+                    reading['cloud_condition'] = 'cloudy'
+                else:
                     reading['cloud_condition'] = 'very cloudy'
-                else: reading['cloud_condition'] = 'cloudy'
+            except (ValueError, TypeError):
+                print("[yellow]警告: sky_temp 无效：", rain_freq_val)
+                reading['cloud_condition'] = 'unknown'
         else:
             reading['cloud_condition'] = 'unknown'
+            print("[yellow]警告: sky_temp is None：", rain_freq_val)
 
         # 风况判断
         reading['wind_condition'] = 'unknown'
-        wind_speed_val = reading.get('wind_speed')
-        if wind_speed_val is not None:
-            try:
-                ws = float(wind_speed_val)
-                # 注意阈值顺序，从最强风开始判断
-                if ws >= self.thresholds.very_gusty: # 假设这是最高风速阈值
-                    reading['wind_condition'] = 'very gusty'
-                elif ws >= self.thresholds.gusty:
-                    reading['wind_condition'] = 'gusty'
-                elif ws >= self.thresholds.very_windy:
-                    reading['wind_condition'] = 'very windy'
-                elif ws >= self.thresholds.windy:
-                    reading['wind_condition'] = 'windy'
-                else:
-                    reading['wind_condition'] = 'calm'
-            except (ValueError, TypeError):
-                print("[yellow]警告: 风速值无效。")
+        if self.has_anemometer is True:
+            # 如果有风速计，使用风速值判断
+            wind_speed_val = reading.get('wind_speed')
+            if wind_speed_val is not None:
+                try:
+                    ws = float(wind_speed_val)
+                    # 注意阈值顺序，从最强风开始判断
+                    if ws >= self.thresholds.very_gusty: # 假设这是最高风速阈值
+                        reading['wind_condition'] = 'very gusty'
+                    elif ws >= self.thresholds.gusty:
+                        reading['wind_condition'] = 'gusty'
+                    elif ws >= self.thresholds.very_windy:
+                        reading['wind_condition'] = 'very windy'
+                    elif ws >= self.thresholds.windy:
+                        reading['wind_condition'] = 'windy'
+                    else:
+                        reading['wind_condition'] = 'calm'
+                except (ValueError, TypeError):
+                    print("[yellow]警告: 风速值无效。")
+                    reading['wind_condition'] = 'unknown'
+            else:
                 reading['wind_condition'] = 'unknown'
-        else:
-            reading['wind_condition'] = 'unknown'
+                print("[yellow]警告: 风速值 is None。")
+
 
         # 雨况判断
         reading['rain_condition'] = 'unknown'
-        rain_freq_val = reading.get('rain_frequency')    
+        rain_freq_val = reading.get('rain_frequency')  
         if rain_freq_val is not None:
             try:
-                rf = float(rain_freq_val)
-                if rf <= self.heater_config.rain_threshold_freq: # 频率越低越湿/雨
+                rf = int(rain_freq_val)
+                if rf <= self.thresholds.rainy: # 频率越低越湿/雨
                     reading['rain_condition'] = 'rainy'
+                elif rf < self.thresholds.wet:
+                    reading['rain_condition'] = 'wet'
                 else:
                     reading['rain_condition'] = 'dry'
             except (ValueError, TypeError):
-                print("[yellow]警告: 雨水频率值无效。")
+                print("[yellow]警告: 雨水频率值无效：", rain_freq_val)
                 reading['rain_condition'] = 'unknown'
         else:
             reading['rain_condition'] = 'unknown'
+            print("[yellow]警告: 雨水频率值is None：", rain_freq_val)
 
-        #优先使用rain_freq 的判断，如果rain_freq 判断是dry，再用ntc判断
-        #sensor_temp_ntc_val = reading.get('rain_sensor_temp_ntc')
-        #if sensor_temp_ntc_val is not None and reading['rain_condition'] == 'dry' :
-
-
-       # 安全标志
+        # 安全标志
         # 确保在所有条件都已知的情况下才判断安全
         cloud_cond = reading['cloud_condition']
         wind_cond = reading['wind_condition']
@@ -695,7 +733,7 @@ class CloudSensor(object):
         reading['wind_safe'] = True if wind_cond == 'calm' else False # 或者根据配置允许一定的风速
         reading['rain_safe'] = True if rain_cond == 'dry' else False
 
-        # 如果任何一个条件是 'unknown'，则整体不安全
+        # 如果任何一个条件是 'unknown'，则整体不安全，
         if 'unknown' in [cloud_cond, wind_cond, rain_cond]:
             reading['is_safe'] = False
         else:
@@ -707,14 +745,16 @@ class CloudSensor(object):
             temp_cloud_safe = reading['cloud_safe']
             temp_wind_safe = reading['wind_safe']
             temp_rain_safe = reading['rain_safe']
-
+            
             if 'cloud' in self.config.ignore_unsafe: temp_cloud_safe = True
             if 'wind' in self.config.ignore_unsafe: temp_wind_safe = True
             if 'rain' in self.config.ignore_unsafe: temp_rain_safe = True
             
+
             # 只有在所有未被忽略的条件都安全时，才认为是安全的
             # 并且，如果原始是安全的，那么忽略不应该使其变得不安全
             # 如果原始是不安全的，忽略某些条件可能使其变为安全
+
             if original_is_safe: # 如果本来就安全，忽略不会改变
                  reading['is_safe'] = True
             else: # 如果本来不安全，看忽略后是否安全
@@ -781,6 +821,96 @@ class CloudSensor(object):
             if self._verbose_logging: print(f"[red]计算 MPSAS 时出错: {e}")
             return None
 
+    def _fetch_electrical_constants(self) -> None:
+        """
+        Fetches and parses the electrical constants from the M! command.
+        Stores the result in self.electrical_constants.
+        """
+        if self._verbose_logging:
+            print("[cyan]尝试获取电气常数 (M!)...")
+
+        m_response_val = self.query(WeatherCommand.GET_ELECTRICAL_CONSTANTS, return_codes=True)
+
+        if m_response_val is COMMUNICATION_ERROR_SENTINEL:
+            if self._verbose_logging:
+                print(f"[red]获取电气常数失败: 通信错误 ({self.last_error_message})")
+            self.electrical_constants = None
+            return
+        
+        if not isinstance(m_response_val, str):
+            if self._verbose_logging:
+                print(f"[red]获取电气常数失败: 响应类型无效 (期望 str, 得到 {type(m_response_val)}). 响应: {m_response_val!r}")
+            self.electrical_constants = None
+            return
+
+        # Expected m_response_val is like "MxxxxxxxxxxxxP" (14 chars: M + 12 data + 1 padding)
+        # The 12 data characters are at indices 1 through 12 (0-indexed from 'M')
+
+        # --- Enhanced debugging for m_response_val ---
+        if self._verbose_logging:
+            print(f"DEBUG _FEC: Raw m_response_val: {m_response_val!r}")
+            print(f"DEBUG _FEC: Type of m_response_val: {type(m_response_val)}")
+            try:
+                # latin1 can represent all byte values; utf-8 might fail on some control chars
+                response_bytes_latin1 = m_response_val.encode('latin1') 
+                print(f"DEBUG _FEC: m_response_val as latin1 bytes: {response_bytes_latin1!r} (len: {len(response_bytes_latin1)})")
+                response_bytes_utf8 = m_response_val.encode('utf-8', errors='surrogateescape')
+                print(f"DEBUG _FEC: m_response_val as UTF-8 bytes (surrogateescape): {response_bytes_utf8!r} (len: {len(response_bytes_utf8)})")
+            except Exception as e_bytes:
+                print(f"DEBUG _FEC: Error converting m_response_val to bytes: {e_bytes}")
+            
+            char_details = []
+            for i, char_in_val in enumerate(m_response_val):
+                char_details.append(f"idx{i}:'{char_in_val!r}'(ord:{ord(char_in_val)})")
+            print(f"DEBUG _FEC: Character details of m_response_val: [{', '.join(char_details)}]")
+        # --- End enhanced debugging ---
+
+        starts_with_m = m_response_val.startswith('M')
+        actual_len = len(m_response_val)
+        # A valid response can be length 13 (unpadded) or 14 (padded)
+        is_valid_len = actual_len == 13 or actual_len == 14
+
+        if not starts_with_m or not is_valid_len:
+            if self._verbose_logging:
+                print(f"[red]获取电气常数失败: 响应格式无效. 响应: {m_response_val!r}")
+                print(f"[red]  - 调试信息: starts_with_m={starts_with_m}, length={actual_len}, is_valid_len={is_valid_len}")
+            self.electrical_constants = None
+            return
+        
+        # Data characters are the 12 characters immediately following 'M'
+        data_chars = m_response_val[1:13] 
+        
+        if len(data_chars) != 12:
+            if self._verbose_logging:
+                print(f"[red]获取电气常数失败: 提取的数据字符长度不是12. 提取: '{data_chars}' (len {len(data_chars)}) 来自: '{m_response_val}'")
+            self.electrical_constants = None
+            return
+
+        try:
+            c = [ord(char) for char in data_chars]
+
+            zener_voltage = (256 * c[0] + c[1]) / 100.0
+            ldr_max_resistance = (256 * c[2] + c[3]) / 1.0
+            ldr_pullup_resistance = (256 * c[4] + c[5]) / 10.0
+            rain_beta = (256 * c[6] + c[7]) / 1.0
+            rain_res_at_25 = (256 * c[8] + c[9]) / 10.0
+            rain_pullup_resistance = (256 * c[10] + c[11]) / 10.0
+
+            self.electrical_constants = {
+                "zener_voltage": zener_voltage,
+                "ldr_max_resistance": ldr_max_resistance,
+                "ldr_pullup_resistance": ldr_pullup_resistance,
+                "rain_beta": rain_beta,
+                "rain_res_at_25": rain_res_at_25,
+                "rain_pullup_resistance": rain_pullup_resistance,
+            }
+            if self._verbose_logging:
+                print(f"[green]电气常数获取成功:[/green] {self.electrical_constants}")
+
+        except Exception as e:
+            if self._verbose_logging:
+                print(f"[red]获取电气常数时解析响应时发生意外错误: {e}. Data chars: '{data_chars}'")
+            self.electrical_constants = None
 
 
     def get_sky_temperature(self) -> float:
@@ -815,6 +945,73 @@ class CloudSensor(object):
         if val is COMMUNICATION_ERROR_SENTINEL: return COMMUNICATION_ERROR_SENTINEL
         return val / 100. if val is not None else None
     
+    def get_rain_sensor_temp(slft, rain_sensor_temp_ntc :float) -> float:
+
+        # 1. 对 rain_sensor_temp_ntc 做范围截断：如果 >1022 则设为 1022；如果 <1 则设为 1
+        if rain_sensor_temp_ntc > 1022.0:
+            rain_sensor_temp_ntc = 1022.0
+        elif rain_sensor_temp_ntc < 1.0:
+            rain_sensor_temp_ntc = 1.0
+
+        # 2. 计算 NTC 实际电阻 r（单位：KΩ），公式：
+        #    r = RainPullUpResistance / ((1023 / rain_sensor_temp_ntc) - 1)
+        #    其中 RainPullUpResistance = 1.0
+        denom_r = (1023.0 / rain_sensor_temp_ntc) - 1.0
+        if denom_r <= 0:
+            # 分母 <=0 时无法计算有效阻值
+            return None
+        r = 1.0 / denom_r  # RainPullUpResistance 固定为 1.0 KΩ
+
+        # 3. 计算对数比值 ratio = ln(r / RainResAt25)
+        #    其中 RainResAt25 = 1.0
+        if r <= 0:
+            return None
+        ratio = math.log(r / 1.0)
+
+        # 4. 根据 Beta 模型公式计算温度（开尔文），再减去 ABSZERO 得到摄氏度
+        #    T(K)  = 1 / ( ( ratio / RainBeta ) + ( 1 / ( ABSZERO + 25 ) ) )
+        #    T(°C) = T(K) - ABSZERO
+        RainBeta = 3450.0
+        ABSZERO = 273.15
+
+        denom_t = (ratio / RainBeta) + (1.0 / (ABSZERO + 25.0))
+        if denom_t == 0:
+            return None
+
+        t_kelvin = 1.0 / denom_t
+        t_celsius = t_kelvin - ABSZERO
+
+        return round(t_celsius,2) if t_celsius is not None else None
+
+    def get_zener_voltage(self, zener_voltage_raw: float) -> float | None:
+        """
+        根据图片中公式：Vs = 1023 * ZenerConstant / xxxx
+        将传入的原始齐纳电压值（zener_voltage_raw，图片中的 xxxx）转换为电压 Vs（伏特）。
+        
+        参数:
+            zener_voltage_raw (float): 设备发送回来的原始值（即图片公式中的 xxxx）。
+        
+        返回:
+            float: 计算得到的齐纳电压（单位：伏特），如果输入无效则返回 None。
+        """
+        # 如果原始值为 0 或者负数，都无法做除法，直接返回 None
+        if zener_voltage_raw is None:
+            return None
+        try:
+            raw = float(zener_voltage_raw)
+        except (ValueError, TypeError):
+            return None
+
+        if raw <= 0:
+            return None
+
+        ZenerConstant = 3  #“齐纳恒定值” 3。
+        # 公式：Vs = 1023 * ZenerConstant / raw
+        Vs = 1023.0 * ZenerConstant / raw
+
+        return round(Vs,2) if Vs is not None else None
+
+
     def get_humidity(self) -> float:
         """Gets the latest relative humidity reading (in %).
 
@@ -1028,7 +1225,9 @@ class CloudSensor(object):
         """
         val = self.query(WeatherCommand.GET_RAIN_FREQUENCY, parse_type=int)
         if val is COMMUNICATION_ERROR_SENTINEL: return COMMUNICATION_ERROR_SENTINEL
-        return round((val / 100 ), 2) if val is not None else None
+
+        #Rain frequency is equal to the value sent by the device.
+        return val if val is not None else None
 
     def get_pwm(self) -> float:
         """Gets the latest PWM reading.
@@ -1121,7 +1320,7 @@ class CloudSensor(object):
         fw_str = self.firmware if self.firmware else "N/A"
         cwinfo_str = f"Serial: {sn_str}, FW: {fw_str}"
         
-        clouds_val = current_reading_dict.get('Tsky_temp') 
+        clouds_val = current_reading_dict.get('sky_temp') 
         temp_val = current_reading_dict.get('ambient_temp')
         wind_val_get = current_reading_dict.get('wind_speed')
         wind_val = round(wind_val_get if wind_val_get is not None else 0.0, 2)
@@ -1217,44 +1416,75 @@ class CloudSensor(object):
 
         # 对于预期返回单个数据块/值的命令
         if len(response_data_parts) == 1:
-            single_block_content = response_data_parts[0]  # "XXyyyyyyyyyyyy"
-            if return_codes:
-                return single_block_content
+            # single_block_content is like "XXyyyyyyyyyyyy<padding>" (14 chars)
+            # or for M!, it could be "M<12_data_bytes>" (13 chars) if the read fix worked.
+            single_block_content_from_read = response_data_parts[0]
+            if return_codes: # If true, return the content string (e.g., "M<data12>" or "S value P")
+                return single_block_content_from_read
             else:
-                value_str = single_block_content[2:].strip() # "yyyyyyyyyyyy"
+                # Extract value part from "IDvalue<padding>" or "ID<data_direct>"
+                value_str_to_parse = ""
                 
-                    # 特殊处理布尔型命令的响应 (例如开关状态)
-                if cmd == WeatherCommand.GET_SWITCH_STATUS:
-                    # 'X' for Open, 'Y' for Closed
-                    if single_block_content[0:2] == WeatherResponseCodes.SWITCH_OPEN.value: # Compare 'X'
-                        return "open" # Open
-                    elif single_block_content[0:2] == WeatherResponseCodes.SWITCH_CLOSED.value: # Compare 'Y'
-                        return "close" # Closed
+                # For commands where data follows ID char directly (K, M, V, N, v)
+                if cmd in [WeatherCommand.GET_SERIAL_NUMBER, 
+                           WeatherCommand.GET_ELECTRICAL_CONSTANTS, 
+                           WeatherCommand.GET_FIRMWARE, 
+                           WeatherCommand.GET_INTERNAL_NAME, 
+                           WeatherCommand.CAN_GET_WINDSPEED]:
+                    # Content from read is "ID<data...><padding>"
+                    # e.g., "KxxxxP", "Mdata12P", "VversionP", "NnameP", "vYP"
+                    # We need the part after the ID char, stripped.
+                    value_str_to_parse = single_block_content_from_read[1:].strip()
+                else: # Standard "ID value_digits<padding>"
+                    # Content from read is "ID valueP"
+                    value_str_to_parse = single_block_content_from_read[2:].strip() 
+
+                if cmd == WeatherCommand.GET_SWITCH_STATUS: # F! -> content "X P" or "Y P"
+                    # single_block_content_from_read is "X       " or "Y       " (with padding)
+                    if single_block_content_from_read.startswith(WeatherResponseCodes.SWITCH_OPEN.value.strip()): # "X"
+                        return "open"
+                    elif single_block_content_from_read.startswith(WeatherResponseCodes.SWITCH_CLOSED.value.strip()): # "Y"
+                        return "close"
                     else:
-                        if effective_verbose: print(f"[yellow]未知的开关状态响应: {single_block_content!r}")
+                        if effective_verbose: print(f"[yellow]未知的开关状态响应: {single_block_content_from_read!r}")
                         return None
-                
-                # 特殊处理 CAN_GET_WINDSPEED ('v!') -> '!v Y' or '!v N'
-                if cmd == WeatherCommand.CAN_GET_WINDSPEED:
-                    return 'Y' in value_str.upper() # value_str here is "Y" or "N" (after strip)
+
+                if cmd == WeatherCommand.CAN_GET_WINDSPEED: # v! -> content "vYP" or "vNP"
+                    # value_str_to_parse will be "Y" or "N"
+                    return 'Y' in value_str_to_parse.upper()
 
                 try:
-                    if parse_type is bool: # 特殊处理布尔型，通常基于字符串内容
-                        return value_str.upper() == 'TRUE' or value_str.upper() == 'Y' # 示例
-                    return parse_type(value_str)
+                    if parse_type is bool: 
+                        return value_str_to_parse.upper() in ['TRUE', 'Y', '1', 'ON']
+                    if parse_type is str: 
+                        return value_str_to_parse
+                    return parse_type(value_str_to_parse) 
                 except (ValueError, TypeError):
-                    if effective_verbose: print(f"[yellow]无法将 '{value_str}' 解析为 {parse_type} (命令: {cmd.name})")
-                    return value_str # 返回原始字符串如果解析失败
+                    if effective_verbose: print(f"[yellow]无法将 '{value_str_to_parse}' (来自块 '{single_block_content_from_read}') 解析为 {parse_type} (命令: {cmd.name})")
+                    return value_str_to_parse 
         
         if effective_verbose: print(f"[yellow]命令 {cmd.name} 预期单个数据块，但收到多个: {response_data_parts}。将尝试返回第一个。")
-        if response_data_parts: # 尝试返回第一个块的值作为备用
-            try: 
-                first_val_str = response_data_parts[0][2:].strip()
-                if parse_type is bool: return first_val_str.upper() == 'TRUE' or first_val_str.upper() == 'Y'
+        if response_data_parts: 
+            try:
+                first_block_content = response_data_parts[0]
+                # Generic attempt, might not be correct for all commands.
+                # Assume it's either "ID<data>" or "ID value"
+                first_val_str = ""
+                if cmd in [WeatherCommand.GET_SERIAL_NUMBER, WeatherCommand.GET_ELECTRICAL_CONSTANTS, WeatherCommand.GET_FIRMWARE, WeatherCommand.GET_INTERNAL_NAME, WeatherCommand.CAN_GET_WINDSPEED]:
+                    first_val_str = first_block_content[1:].strip()
+                else:
+                    first_val_str = first_block_content[2:].strip()
+                
+                if parse_type is bool: return first_val_str.upper() in ['TRUE', 'Y', '1', 'ON']
+                if parse_type is str: return first_val_str
                 return parse_type(first_val_str)
-            except: return response_data_parts[0][2:].strip()
-
-        return None # 如果所有情况都不匹配，返回 None
+            except Exception as e_fallback:
+                if effective_verbose: print(f"[yellow]Fallback parsing of first block failed: {e_fallback}")
+                # As a very last resort, return the stripped string part of the first block content
+                # This depends on the structure, but [1:] or [2:] might be too aggressive if block is short
+                if len(response_data_parts[0]) > 1 :
+                    return response_data_parts[0][1:].strip() if response_data_parts[0][0].isalpha() else response_data_parts[0][2:].strip()
+                return response_data_parts[0].strip()
 
     def write(self, cmd: WeatherCommand, cmd_params: str = '', cmd_delim: str = '!') -> int:
         # 
@@ -1309,7 +1539,7 @@ class CloudSensor(object):
             # 状态可能已是 DISCONNECTED 或 ERROR，这里再次确认
             if self._connection_status == ConnectionStatus.CONNECTED: # 如果之前认为是连接的，现在发现串口关闭
                 self._connection_status = ConnectionStatus.DISCONNECTED
-            else:
+            elif self._connection_status not in [ConnectionStatus.ATTEMPTING_RECONNECT, ConnectionStatus.INITIALIZING]:
                 self._connection_status = ConnectionStatus.ERROR    
             if effective_verbose: print(f"[red]{self.last_error_message}")
             raise SensorCommunicationError(self.last_error_message)
@@ -1336,7 +1566,7 @@ class CloudSensor(object):
             # This assumes the device sends all blocks for a command relatively quickly.
             
             # Wait briefly for data to arrive after a write
-            time.sleep(0.2) # Adjust as needed; depends on device response time
+            time.sleep(0.05) # Adjust as needed; depends on device response time
 
             # Read in a loop until handshake is detected or timeout occurs (implicit via serial timeout)
             # 循环读取，直到找到握手或没有更多数据（超时）
@@ -1367,7 +1597,7 @@ class CloudSensor(object):
 
             full_response_decoded = buffer.decode(errors='ignore')
 
-            if effective_verbose: print(f'读取的原始响应 (解码后): {full_response_decoded!r}')
+            #if effective_verbose: print(f'解码前原始响应: {full_response_decoded!r}')
 
             if return_raw:
                 return full_response_decoded
@@ -1399,6 +1629,7 @@ class CloudSensor(object):
             
             idx = 0
 
+            # Try to parse in 15-byte chunks first
             while (idx + 15) <= len(data_to_parse):
                 block = data_to_parse[idx:idx + 15]
 
@@ -1408,10 +1639,26 @@ class CloudSensor(object):
                     break 
                 all_data_blocks_content.append(block[1:])
                 idx += 15
-            
-            if idx < len(data_to_parse) and effective_verbose:
-                    print(f"[yellow]解析数据块后仍有剩余字符: {data_to_parse[idx:]!r}")
 
+            # If no 15-byte blocks were parsed by the loop,
+            # but data_to_parse itself is a single non-empty block starting with '!'
+            # This handles cases like M! or K! if they send less than 15 chars for their data block part.
+            if not all_data_blocks_content and data_to_parse and data_to_parse.startswith('!'):
+                if effective_verbose:
+                    print(f"[grey]DEBUG READ: No 15-byte blocks parsed by loop. Treating data_to_parse ('{data_to_parse!r}') as a single block.")
+                # The content is what's after the '!', this is the "ID<data><padding>" part.
+                # For M! if data_to_parse is "!M<data12>" (len 14), content is "M<data12>" (len 13).
+                # For K! if data_to_parse is "!Kxxxx" (len 6), content is "Kxxxx" (len 5).
+                # This content is what query() expects when return_codes=True for these commands.
+                single_block_data_content = data_to_parse[1:]
+                all_data_blocks_content.append(single_block_data_content)
+                idx = len(data_to_parse) # Mark as fully parsed    
+            # Check for any remaining characters that were not part of a 15-byte block or the single block logic
+            if idx < len(data_to_parse) and effective_verbose:
+                    print(f"[yellow]DEBUG READ：解析数据块后仍有剩余字符: {data_to_parse[idx:]!r}")
+            
+            
+            if effective_verbose: print(f"Reading : {all_data_blocks_content}")
             return all_data_blocks_content
 
         except serial.SerialException as e:
@@ -1436,16 +1683,16 @@ class CloudSensor(object):
         # 规则0: 确保输入有效
         if ambient_temp is None or rain_frequency is None:
             if self._verbose_logging:
-                print("[yellow]HEATER LOGIC: Ambient temp or rain frequency is None, cannot determine target PWM. Defaulting to 0.")
+                print("[yellow]LOGIC: Ambient temp or rain frequency is None, cannot determine target PWM. Defaulting to 0.")
             return 0.0
 
         # 规则1: 冲击加热 (最高优先级)
         if self.is_impulse_active and self.impulse_active_end_time and now < self.impulse_active_end_time:
-            if self._verbose_logging: print(f"HEATER LOGIC: Impulse active, duration not over. Target PWM: 100%")
+            if self._verbose_logging: print(f"LOGIC: Impulse active, duration not over. Target PWM: 100%")
             return 100.0
         elif self.is_impulse_active: 
             self.is_impulse_active = False # 冲击持续时间结束
-            if self._verbose_logging: print(f"HEATER LOGIC: Impulse duration just ended. Recalculating PWM for this cycle.")
+            if self._verbose_logging: print(f"LOGIC: Impulse duration just ended. Recalculating PWM for this cycle.")
             # 冲击结束后，本轮将根据其他规则计算PWM
 
         if ambient_temp <= cfg.impulse_temp: # 检查是否应触发新的冲击
@@ -1456,7 +1703,7 @@ class CloudSensor(object):
                     can_trigger_new_impulse = False
             
             if can_trigger_new_impulse:
-                if self._verbose_logging: print(f"HEATER LOGIC: Triggering new impulse. Ambient: {ambient_temp}°C <= {cfg.impulse_temp}°C. Target PWM: 100%")
+                if self._verbose_logging: print(f"LOGIC: Triggering new impulse. Ambient: {ambient_temp}°C <= {cfg.impulse_temp}°C. Target PWM: 100%")
                 self.is_impulse_active = True
                 self.impulse_active_end_time = now + timedelta(seconds=cfg.impulse_duration)
                 self.last_impulse_start_time = now
@@ -1465,7 +1712,7 @@ class CloudSensor(object):
         # 规则2: 湿态/下雨检测 (如果不在冲击加热的主动持续时间内)
         if rain_frequency < cfg.rain_threshold_freq: 
             calculated_target_pwm = cfg.pwm_max
-            if self._verbose_logging: print(f"HEATER LOGIC (Wet): Rain Freq ({rain_frequency} Hz) < Threshold ({cfg.rain_threshold_freq} Hz). Target: {calculated_target_pwm}%")
+            if self._verbose_logging: print(f"LOGIC (Wet): Rain Freq ({rain_frequency} Hz) < Threshold ({cfg.rain_threshold_freq} Hz). Target: {calculated_target_pwm}%")
             return calculated_target_pwm
 
         # 规则3: 干燥状态下的温度控制 (应用新的迟滞逻辑)
@@ -1475,12 +1722,12 @@ class CloudSensor(object):
         # 严格关闭条件
         if ambient_temp >= cfg.high_temp:  # Ta >= 20°C
             calculated_target_pwm = 0.0
-            if self._verbose_logging: print(f"HEATER LOGIC (Dry): Ta ({ambient_temp}°C) >= high_temp ({cfg.high_temp}°C). Target: 0.0%")
+            if self._verbose_logging: print(f"LOGIC (Dry): Ta ({ambient_temp}°C) >= high_temp ({cfg.high_temp}°C). Target: 0.0%")
         
         # 严格中等功率保温条件
         elif ambient_temp <= cfg.low_temp:  # Ta <= 0°C
             calculated_target_pwm = cfg.pwm_mid
-            if self._verbose_logging: print(f"HEATER LOGIC (Dry): Ta ({ambient_temp}°C) <= low_temp ({cfg.low_temp}°C). Target: {cfg.pwm_mid}%")
+            if self._verbose_logging: print(f"LOGIC (Dry): Ta ({ambient_temp}°C) <= low_temp ({cfg.low_temp}°C). Target: {cfg.pwm_mid}%")
         
         # 处理迟滞区间和中间区域
         else: # Ta is strictly between low_temp (0°C) and high_temp (20°C)
@@ -1490,14 +1737,14 @@ class CloudSensor(object):
                 if ambient_temp < (cfg.high_temp - cfg.high_delta): # Ta < 16°C
                     if ambient_temp <= (cfg.low_temp + cfg.low_delta): # Ta <= 6°C (也覆盖了 Ta <= 0°C)
                         calculated_target_pwm = cfg.pwm_mid
-                        if self._verbose_logging: print(f"HEATER LOGIC (Dry): Ta ({ambient_temp}°C) < 16°C and <= 6°C, was OFF. Target: {cfg.pwm_mid}%")
+                        if self._verbose_logging: print(f"LOGIC (Dry): Ta ({ambient_temp}°C) < 16°C and <= 6°C, was OFF. Target: {cfg.pwm_mid}%")
                     else: # 6°C < Ta < 16°C
                         calculated_target_pwm = cfg.pwm_low
-                        if self._verbose_logging: print(f"HEATER LOGIC (Dry): Ta ({ambient_temp}°C) in (6-16)°C band, was OFF. Target: {cfg.pwm_low}%")
+                        if self._verbose_logging: print(f"LOGIC (Dry): Ta ({ambient_temp}°C) in (6-16)°C band, was OFF. Target: {cfg.pwm_low}%")
                 # else: Ta 在 [16°C, 20°C) 并且之前是OFF，保持 calculated_target_pwm = 0.0 (来自 last_set_pwm_percent)
                 # 实际上，如果 self.last_set_pwm_percent == 0.0，则 calculated_target_pwm 已经是 0.0
                 # 所以这个分支下，如果 Ta >= 16，它会保持 0.0
-                elif self._verbose_logging: print(f"HEATER LOGIC (Dry): Ta ({ambient_temp}°C) in [16-20)°C band, was OFF. Maintaining Target: 0.0%")
+                elif self._verbose_logging: print(f"LOGIC (Dry): Ta ({ambient_temp}°C) in [16-20)°C band, was OFF. Maintaining Target: 0.0%")
 
 
             # 如果上次PWM是 pwm_mid (40%) (因为温度曾 <= 0°C)
@@ -1506,9 +1753,9 @@ class CloudSensor(object):
                 if ambient_temp > (cfg.low_temp + cfg.low_delta): # Ta > 6°C
                     # 此处 Ta 仍在 (6°C, 20°C) 区间内
                     calculated_target_pwm = cfg.pwm_low # 切换到低保温
-                    if self._verbose_logging: print(f"HEATER LOGIC (Dry): Ta ({ambient_temp}°C) > 6°C, was MID. Target: {cfg.pwm_low}%")
+                    if self._verbose_logging: print(f"HLOGIC (Dry): Ta ({ambient_temp}°C) > 6°C, was MID. Target: {cfg.pwm_low}%")
                 # else: Ta 仍在 (0°C, 6°C] 并且之前是MID，保持 calculated_target_pwm = pwm_mid (来自 last_set_pwm_percent)
-                elif self._verbose_logging: print(f"HEATER LOGIC (Dry): Ta ({ambient_temp}°C) in (0-6]°C band, was MID. Maintaining Target: {cfg.pwm_mid}%")
+                elif self._verbose_logging: print(f"LOGIC (Dry): Ta ({ambient_temp}°C) in (0-6]°C band, was MID. Maintaining Target: {cfg.pwm_mid}%")
 
 
             # 如果上次PWM是 pwm_low (15%) (因为温度在 6°C-16°C 区间)
@@ -1520,14 +1767,14 @@ class CloudSensor(object):
                 # 但如果 Ta 降到 <=6°C，应变为 pwm_mid。
                 if ambient_temp <= (cfg.low_temp + cfg.low_delta): # Ta <= 6°C
                     calculated_target_pwm = cfg.pwm_mid
-                    if self._verbose_logging: print(f"HEATER LOGIC (Dry): Ta ({ambient_temp}°C) <= 6°C, was LOW. Target: {cfg.pwm_mid}%")
+                    if self._verbose_logging: print(f"LOGIC (Dry): Ta ({ambient_temp}°C) <= 6°C, was LOW. Target: {cfg.pwm_mid}%")
                 # elif ambient_temp >= (cfg.high_temp - cfg.high_delta): # Ta >= 16°C (但 < 20°C)
                 #     calculated_target_pwm = self.last_set_pwm_percent # 保持 pwm_low，因为这是 "保持上一次状态"
-                #     if self._verbose_logging: print(f"HEATER LOGIC (Dry): Ta ({ambient_temp}°C) in [16-20)°C band, was LOW. Maintaining Target: {cfg.pwm_low}%")
+                #     if self._verbose_logging: print(f"LOGIC (Dry): Ta ({ambient_temp}°C) in [16-20)°C band, was LOW. Maintaining Target: {cfg.pwm_low}%")
                 else: # Ta 在 (6°C, 20°C) 并且之前是 LOW。如果 Ta >= 16, 应该保持。如果 Ta < 16, 保持。
                       # 所以，如果 Ta 没有触发 >=20(OFF) 或 <=0(MID)，且之前是LOW，则目标保持为LOW。
                     calculated_target_pwm = cfg.pwm_low # 保持
-                    if self._verbose_logging: print(f"HEATER LOGIC (Dry): Ta ({ambient_temp}°C) in (6-20)°C band, was LOW. Maintaining Target: {cfg.pwm_low}%")
+                    if self._verbose_logging: print(f"LOGIC (Dry): Ta ({ambient_temp}°C) in (6-20)°C band, was LOW. Maintaining Target: {cfg.pwm_low}%")
 
             # 如果 last_set_pwm_percent 是其他值 (例如 100% 刚从冲击加热结束)
             # 则根据当前温度重新判断所属的稳定区间
@@ -1541,7 +1788,7 @@ class CloudSensor(object):
                       # 按“保持上次状态”的原则，应该维持上次非冲击状态的pwm。但我们不知道那个状态。
                       # 所以这里也用简单区间逻辑：如果 >=16，目标0%。
                     calculated_target_pwm = 0.0 # 默认关闭
-                if self._verbose_logging: print(f"HEATER LOGIC (Dry): Ta ({ambient_temp}°C), last_set_pwm was non-standard ({self.last_set_pwm_percent}%), re-evaluating to bands. Target: {calculated_target_pwm}%")
+                if self._verbose_logging: print(f"LOGIC (Dry): Ta ({ambient_temp}°C), last_set_pwm was non-standard ({self.last_set_pwm_percent}%), re-evaluating to bands. Target: {calculated_target_pwm}%")
         # --- 结束修改 ---
             
         return calculated_target_pwm
@@ -1551,7 +1798,7 @@ class CloudSensor(object):
         if current_status is None: current_status = self.status 
   
         if not current_status:
-            if self._verbose_logging: print("[yellow]HEATER MANAGE: No current readings available to manage heater.")
+            if self._verbose_logging: print("[yellow]HEATER: No current readings available to manage heater.")
             return
 
         ambient_temp = current_status.get('ambient_temp')
@@ -1559,29 +1806,29 @@ class CloudSensor(object):
 
         if ambient_temp is None or rain_frequency is None:
             if self._verbose_logging:
-                print(f"[yellow]HEATER MANAGE: Ambient temp ({ambient_temp}) or rain frequency ({rain_frequency}) is None. Cannot manage heater.")
+                print(f"[yellow]HEATER: Ambient temp ({ambient_temp}) or rain frequency ({rain_frequency}) is None. Cannot manage heater.")
             return
 
         self.current_target_pwm_percent = self._calculate_target_pwm(ambient_temp, rain_frequency)
         if self._verbose_logging:
-            print(f"HEATER MANAGE: Calculated target PWM: {self.current_target_pwm_percent}%. Last set PWM: {self.last_set_pwm_percent}%. Hysteresis: {self.heater_config.hysteresis}%")
+            print(f"HEATER: Calculated target PWM: {self.current_target_pwm_percent}%. Last set PWM: {self.last_set_pwm_percent}%. Hysteresis: {self.heater_config.hysteresis}%")
 
         if abs(self.current_target_pwm_percent - self.last_set_pwm_percent) >= self.heater_config.hysteresis:
             if self._verbose_logging:
-                print(f"HEATER MANAGE: Target PWM differs enough. Attempting to set PWM to {self.current_target_pwm_percent}%")
+                print(f"HEATER: Target PWM differs enough. Attempting to set PWM to {self.current_target_pwm_percent}%")
             
             set_success = self.set_pwm(self.current_target_pwm_percent) 
 
             if set_success is COMMUNICATION_ERROR_SENTINEL:
-                if self._verbose_logging: print(f"[red]HEATER MANAGE: Communication error while trying to set PWM to {self.current_target_pwm_percent}%.")
+                if self._verbose_logging: print(f"[red]HEATER: Communication error while trying to set PWM to {self.current_target_pwm_percent}%.")
             elif set_success: # set_pwm 返回 True
-                if self._verbose_logging: print(f"[green]HEATER MANAGE: Successfully set PWM to {self.current_target_pwm_percent}%.")
+                if self._verbose_logging: print(f"[green]HEATER: Successfully set PWM to {self.current_target_pwm_percent}%.")
                 self.last_set_pwm_percent = self.current_target_pwm_percent 
             else: # set_pwm 返回 False
-                if self._verbose_logging: print(f"[yellow]HEATER MANAGE: Failed to set PWM to {self.current_target_pwm_percent}% (set_pwm returned False).")
+                if self._verbose_logging: print(f"[yellow]HEATER: Failed to set PWM to {self.current_target_pwm_percent}% (set_pwm returned False).")
         else:
             if self._verbose_logging:
-                print(f"HEATER MANAGE: Target PWM ({self.current_target_pwm_percent}%) within hysteresis range of last set PWM ({self.last_set_pwm_percent}%). No change.")
+                print(f"HEATER: Target PWM ({self.current_target_pwm_percent}%) within hysteresis of last PWM ({self.last_set_pwm_percent}%).No change.")
 
     
     def ntc_raw_to_resistance(self, adc_raw: int) -> float | None:
@@ -1623,7 +1870,14 @@ class CloudSensor(object):
         return resistance
 
     def __str__(self):
-        return f'CloudSensor({self.name}, FW={self.firmware}, SN={self.serial_number}, Port={self.config.serial_port}, Status={self._connection_status.value})'
+        conn_status_val = self._connection_status.value if hasattr(self, '_connection_status') and self._connection_status else 'N/A'
+        elec_const_str = "None"
+        if self.electrical_constants:
+            elec_const_str = ", ".join([f"{k}={v:.2f}" for k,v in self.electrical_constants.items()])
+
+        return (f'CloudSensor(Name={self.name or "N/A"}, FW={self.firmware or "N/A"}, SN={self.serial_number or "N/A"}, '
+                f'Port={self.config.serial_port if hasattr(self, "config") else "N/A"}, Status={conn_status_val}, '
+                f'ElectricalConst=[{elec_const_str}])')
 
     def __del__(self):
         if hasattr(self, '_sensor') and self._sensor and self._sensor.is_open:

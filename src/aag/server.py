@@ -12,13 +12,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError # 导入 zoneinfo
 from aag.weather import CloudSensor, ConnectionStatus, SensorCommunicationError  # 假设 CloudSensor 在 aag.weather 中
 # from aag.solo_formatter import format_reading_for_solo # 如果您将辅助函数放在单独文件
 # 从 aag.settings 导入 WeatherSettings 以便在模块加载时读取配置
-from aag.settings import WeatherSettings
+from aag.settings import WeatherSettings, Skytemp, Thresholds
 
 app = FastAPI()
 
 sensor: Optional[CloudSensor] = None
 
 PERIODIC_TASK_INTERVAL_SECONDS = 30  # Default value
+
 try:
     # 尝试加载配置以获取任务执行间隔
     # 这将在服务启动时从环境变量或 .env 文件读取
@@ -32,7 +33,15 @@ except NameError as ne:
 except Exception as e_cfg:
     # 如果加载配置失败（非 NameError），使用默认值并打印警告
     print(f"[yellow]Warning: Could not load WeatherSettings for task interval (Error type: {type(e_cfg).__name__}), using default {PERIODIC_TASK_INTERVAL_SECONDS}s. Error: {e_cfg}")
-    
+
+class InternalErrorResponse(BaseModel):
+    timestamp_utc: datetime
+    addr1_byte_errors: int
+    cmd_byte_errors: int
+    addr2_byte_errors: int
+    pec_byte_errors: int
+    notes: str
+
 # 新增：用于 /state 端点的 Pydantic 响应模型
 class SensorStateResponse(BaseModel):
     service_status: str 
@@ -47,6 +56,10 @@ class SensorStateResponse(BaseModel):
     capture_delay_seconds: Optional[float] = None 
     readings_buffer_size: Optional[int] = None
     readings_in_buffer: Optional[int] = None
+    zener_voltage: Optional[float] = None
+    #用于展示配置参数的字段
+    skytemp_params: Optional[Skytemp] = None
+    safety_thresholds: Optional[Thresholds] = None    
 
 # 这个函数不再是启动事件，只是一个普通的初始化函数
 def do_init_sensor():
@@ -96,8 +109,11 @@ async def periodic_sensor_reading_task():
             else:
                 print(f"[{datetime.now(timezone.utc).isoformat()}] server.py: Sensor re-initialized. Current status: {sensor.connection_status.value}")
 
+        avg_times = 5
         if hasattr(sensor, 'config') and sensor.config is not None:
             verbose_logging_enabled = getattr(sensor.config, 'verbose_logging', False)
+            avg_times = getattr(sensor.config, 'avg_times', 5) # 获取 avg_times 配置，默认为 5
+        
 
         if sensor.connection_status != ConnectionStatus.CONNECTED:
             if sensor.connection_status != ConnectionStatus.ATTEMPTING_RECONNECT:
@@ -129,7 +145,10 @@ async def periodic_sensor_reading_task():
             start_time = datetime.now(timezone.utc)
             
             try:
-                new_reading_data = sensor.get_reading(avg_times=1, units='none', verbose=verbose_logging_enabled)
+                new_reading_data = sensor.get_reading(
+                    avg_times=avg_times, 
+                    units='none', 
+                    verbose=verbose_logging_enabled)
                 
                 end_time = datetime.now(timezone.utc)
                 duration = (end_time - start_time).total_seconds()
@@ -174,8 +193,10 @@ async def periodic_sensor_reading_task():
                      sensor._connection_status = ConnectionStatus.ERROR 
                      sensor.last_error_message = f"Unexpected error in get_reading task: {e_get_reading}"
         
+        sleep_time = max(0, PERIODIC_TASK_INTERVAL_SECONDS - duration) if duration is not None else 0
+        if verbose_logging_enabled: print(f"server.py: --- sleep time is {sleep_time:.2f} seconds.")
         # 等待下一个周期
-        await asyncio.sleep(PERIODIC_TASK_INTERVAL_SECONDS)
+        await asyncio.sleep(sleep_time)
 
 # --- 新增：新的启动事件，负责初始化和启动后台任务 ---
 @app.on_event("startup")
@@ -186,6 +207,35 @@ async def startup_event():
     print("Background task scheduling...")
     asyncio.create_task(periodic_sensor_reading_task()) # 创建并启动后台任务
     print("Background task scheduled.")
+
+# --- API 端点 ---
+
+# 新增: /weather/error 接口
+@app.get('/weather/error', response_model=InternalErrorResponse, summary="按需查询设备的内部通信错误计数")
+async def get_internal_errors():
+    """
+    实时向设备发送 D! 指令并获取内部错误计数。
+    注意：此操作会重置设备上的错误计数器。
+    """
+    global sensor
+    if sensor is None or not sensor.is_connected:
+        raise HTTPException(status_code=503, detail="Sensor not available or not connected. Cannot query errors.")
+    
+    # 直接调用 sensor 的 get_errors 方法进行实时查询
+    error_counts = sensor.get_errors()
+    
+    # 检查 get_errors 的返回值
+    if not isinstance(error_counts, list) or len(error_counts) != 4:
+        raise HTTPException(status_code=500, detail=f"Failed to get valid error data from sensor. Received: {error_counts!r}")
+
+    return InternalErrorResponse(
+        timestamp_utc=datetime.now(timezone.utc),
+        addr1_byte_errors=error_counts[0],
+        cmd_byte_errors=error_counts[1],
+        addr2_byte_errors=error_counts[2],
+        pec_byte_errors=error_counts[3],
+        notes="Error counters on the device are reset after this read."
+    )
 
 
 # weather/state API 端点
@@ -215,9 +265,13 @@ def get_sensor_state():
     # 确保 sensor.config 存在
     capture_delay_val = None 
     serial_p = None
+    skytemp_cfg = None
+    thresholds_cfg = None
     if hasattr(sensor, 'config') and sensor.config is not None:
         capture_delay_val = getattr(sensor.config, 'capture_delay', None)
         serial_p = getattr(sensor.config, 'serial_port', None)
+        skytemp_cfg = sensor.config.skytemp
+        thresholds_cfg = sensor.config.thresholds
 
     last_successful_reading_local = None
     if sensor.last_successful_read_timestamp: 
@@ -246,7 +300,10 @@ def get_sensor_state():
         current_server_time=current_server_time_local, 
         capture_delay_seconds=capture_delay_val, 
         readings_buffer_size=sensor.readings.maxlen if hasattr(sensor, 'readings') and sensor.readings else None,
-        readings_in_buffer=len(sensor.readings) if hasattr(sensor, 'readings') and sensor.readings else 0
+        readings_in_buffer=len(sensor.readings) if hasattr(sensor, 'readings') and sensor.readings else 0,
+        zener_voltage=sensor.zener_voltage,
+        skytemp_params=skytemp_cfg,
+        safety_thresholds=thresholds_cfg        
     )
 
 

@@ -16,8 +16,8 @@ class Thresholds(BaseModel):
     very_windy: float = 75
     gusty: float = 100
     very_gusty: float = 125
-    wet: int = 2200
-    rainy: int = 1800
+    wet: int = 3000
+    rainy: int = 2800
 
 
 class Heater(BaseModel):
@@ -64,9 +64,11 @@ class WeatherSettings(BaseSettings):
     serial_port: str = '/dev/ttyUSB0'
     safety_delay: float = 15  # minutes
     capture_delay: float = 30  # seconds
-    num_readings: int = 10
+    num_readings: int = 5
+    avg_times: int = 5
     sq_reference: float = 19.6 # SQReference
-    ignore_unsafe: bool | None = None  # None, otherwise can be a list, e.g. 'rain','cloud','gust','wind'
+    #ignore_unsafe: bool | None = None  # None, otherwise can be a list, e.g. 'rain','cloud','gust','wind'
+    ignore_unsafe: list[str] | None = ['rain']  #None, otherwise can be a list, e.g. 'rain','cloud','gust','wind'
     verbose_logging: bool = False
     serial_port_open_delay_seconds: float = 1 # seconds
     solo_data_file_path: str = './'
